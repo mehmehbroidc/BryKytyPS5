@@ -2016,9 +2016,10 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 			auto*              results      = reinterpret_cast<volatile uint64_t*>(event_address);
 			const auto         value        = ready_bit | m_synthetic_occlusion_counter;
 			for (uint32_t db = 0; db < 16u; db++) {
-				results[db * 2u] = value;
+				results[db * 2u]     = value;
+				results[db * 2u + 1u] = value + 1u;
 			}
-			m_synthetic_occlusion_counter = (m_synthetic_occlusion_counter + 1u) & counter_mask;
+			m_synthetic_occlusion_counter = (m_synthetic_occlusion_counter + 2u) & counter_mask;
 			break;
 		}
 		default:

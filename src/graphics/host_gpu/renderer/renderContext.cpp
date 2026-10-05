@@ -94,8 +94,22 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	if (access == PageFaultAccess::Write) {
 		DrainStats::ReasonScope reason(gpu_thread ? DrainStats::Reason::GpuThreadWriteFault
 		                                          : DrainStats::Reason::GuestWriteFault);
-		RecordUpload(UploadSource::Fault, fault_vaddr, 0x1000);
-		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
+		// Batch unprotect the 64 KiB slice around the fault address within mapped bounds
+		// so subsequent writes by worker threads into the same buffer avoid triggering page faults.
+		constexpr uint64_t BatchSliceSize = 64 * 1024;
+		uint64_t write_vaddr = fault_vaddr;
+		uint64_t write_size  = 0x1000;
+		{
+			std::shared_lock lock(m_mapped_ranges_mutex);
+			const auto [clamped_vaddr, clamped_size] =
+			    m_mapped_ranges.ClampedRange(fault_vaddr & ~(BatchSliceSize - 1u), BatchSliceSize);
+			if (clamped_size != 0) {
+				write_vaddr = clamped_vaddr;
+				write_size  = clamped_size;
+			}
+		}
+		RecordUpload(UploadSource::Fault, write_vaddr, write_size);
+		m_buffer_cache.InvalidateMemory(write_vaddr, write_size);
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 		if (gpu_thread) {
 			// The command stream writes this (WRITE_DATA, fills): later draws must see it.

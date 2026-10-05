@@ -97,6 +97,23 @@ public:
 		}
 	}
 
+	[[nodiscard]] std::pair<uint64_t, uint64_t> ClampedRange(uint64_t address, uint64_t size) const {
+		if (size == 0) {
+			return {address, 0};
+		}
+		auto it = m_ranges.upper_bound(address);
+		if (it == m_ranges.begin()) {
+			return {address, size};
+		}
+		--it;
+		if (it->first <= address && it->second > address) {
+			const auto begin = std::max(address, it->first);
+			const auto end   = std::min(address + size, it->second);
+			return {begin, end > begin ? end - begin : 0};
+		}
+		return {address, size};
+	}
+
 	[[nodiscard]] bool Empty() const { return m_ranges.empty(); }
 
 private:
