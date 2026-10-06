@@ -23,8 +23,19 @@
 #include <unordered_set>
 #include <vector>
 #if defined(_WIN32)
+#include <intrin.h>
 #include <xbyak/xbyak.h>
 #include <xbyak/xbyak_util.h>
+
+static bool HostHasSse4a() {
+	int regs[4] {};
+	__cpuid(regs, static_cast<int>(0x80000000u));
+	if (static_cast<unsigned>(regs[0]) < 0x80000001u) {
+		return false;
+	}
+	__cpuid(regs, static_cast<int>(0x80000001u));
+	return (regs[2] & (1 << 6)) != 0;
+}
 #endif
 
 #ifdef min
@@ -815,18 +826,199 @@ bool IsHostEmulatedAmdInstruction(const ZydisDecodedInstruction& instruction) {
 void CollectHostEmulatedAmdInstructions(const DecodedFunction& function,
                                         std::map<uintptr_t, InstructionRewrite>& rewrite_sites,
                                         RedZonePatchResult& result) {
-	if (!function.uses_red_zone) {
-		return;
-	}
 	for (const auto& [address, decoded]: function.instructions) {
-		if (!IsHostEmulatedAmdInstruction(decoded.instruction) || !decoded.red_zone_live.any() ||
-		    rewrite_sites.contains(address)) {
+		if (!IsHostEmulatedAmdInstruction(decoded.instruction) || rewrite_sites.contains(address)) {
 			continue;
 		}
 		rewrite_sites[address].protect_red_zone = true;
 		++result.host_emulated_instruction_count;
 	}
 }
+
+#if defined(_WIN32)
+static bool EmitEmulatedAmdInstruction(const DecodedCodeInstruction& decoded,
+                                       Xbyak::CodeGenerator&         generator) {
+	switch (decoded.instruction.mnemonic) {
+		case ZYDIS_MNEMONIC_EXTRQ: {
+			if (decoded.operands[0].type != ZYDIS_OPERAND_TYPE_REGISTER ||
+			    ZydisRegisterGetClass(decoded.operands[0].reg.value) != ZYDIS_REGCLASS_XMM) {
+				return false;
+			}
+			const int dest_id = ZydisRegisterGetId(decoded.operands[0].reg.value);
+			if (dest_id < 0 || dest_id > 15) {
+				return false;
+			}
+
+			if (decoded.operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+				if (ZydisRegisterGetClass(decoded.operands[1].reg.value) != ZYDIS_REGCLASS_XMM) {
+					return false;
+				}
+				const int src_id = ZydisRegisterGetId(decoded.operands[1].reg.value);
+				if (src_id < 0 || src_id > 15) {
+					return false;
+				}
+
+				// EXTRQ XMMd, XMMs:
+				// Bitfield extraction from XMMd[63:0], controlled by XMMs[63:0].
+				// length = XMMs[5:0] (0 means 64)
+				// index  = XMMs[13:8]
+				// Result written to XMMd[63:0], upper quadword XMMd[127:64] zeroed.
+				generator.db(0x9c); // pushfq
+				generator.push(rax);
+				generator.push(rcx);
+				generator.push(rdx);
+
+				generator.movq(rax, Xbyak::Xmm(dest_id));
+				generator.movq(rdx, Xbyak::Xmm(src_id));
+
+				generator.mov(rcx, rdx);
+				generator.shr(rcx, 8);
+				generator.shr(rax, cl);
+
+				generator.mov(ecx, 64);
+				generator.sub(ecx, edx);
+				generator.shl(rax, cl);
+				generator.shr(rax, cl);
+
+				generator.movq(Xbyak::Xmm(dest_id), rax);
+
+				generator.pop(rdx);
+				generator.pop(rcx);
+				generator.pop(rax);
+				generator.db(0x9d); // popfq
+				return true;
+			} else if (decoded.operands[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
+			           decoded.operands[2].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+				const uint8_t length = static_cast<uint8_t>(decoded.operands[1].imm.value.u & 0x3fu);
+				const uint8_t index  = static_cast<uint8_t>(decoded.operands[2].imm.value.u & 0x3fu);
+				const uint8_t shift  = static_cast<uint8_t>((64u - length) & 0x3fu);
+
+				generator.db(0x9c); // pushfq
+				generator.push(rax);
+
+				generator.movq(rax, Xbyak::Xmm(dest_id));
+				if (index != 0) {
+					generator.shr(rax, index);
+				}
+				if (shift != 0) {
+					generator.shl(rax, shift);
+					generator.shr(rax, shift);
+				}
+				generator.movq(Xbyak::Xmm(dest_id), rax);
+
+				generator.pop(rax);
+				generator.db(0x9d); // popfq
+				return true;
+			}
+			return false;
+		}
+
+		case ZYDIS_MNEMONIC_INSERTQ: {
+			if (decoded.operands[0].type != ZYDIS_OPERAND_TYPE_REGISTER ||
+			    ZydisRegisterGetClass(decoded.operands[0].reg.value) != ZYDIS_REGCLASS_XMM ||
+			    decoded.operands[1].type != ZYDIS_OPERAND_TYPE_REGISTER ||
+			    ZydisRegisterGetClass(decoded.operands[1].reg.value) != ZYDIS_REGCLASS_XMM) {
+				return false;
+			}
+			const int dest_id = ZydisRegisterGetId(decoded.operands[0].reg.value);
+			const int src_id  = ZydisRegisterGetId(decoded.operands[1].reg.value);
+			if (dest_id < 0 || dest_id > 15 || src_id < 0 || src_id > 15) {
+				return false;
+			}
+
+			if (decoded.instruction.operand_count_visible == 2) {
+				generator.db(0x9c); // pushfq
+				generator.push(rax);
+				generator.push(rcx);
+				generator.push(rdx);
+				generator.push(r8);
+				generator.push(r9);
+
+				generator.movq(rax, Xbyak::Xmm(dest_id));
+				generator.movq(rdx, Xbyak::Xmm(src_id));
+
+				generator.mov(r8, rdx);
+				generator.mov(ecx, 64);
+				generator.sub(ecx, edx);
+				generator.shl(r8, cl);
+				generator.shr(r8, cl);
+
+				generator.mov(rcx, rdx);
+				generator.shr(rcx, 8);
+				generator.shl(r8, cl);
+
+				generator.mov(r9, static_cast<uint64_t>(~0ULL));
+				generator.mov(ecx, 64);
+				generator.sub(ecx, edx);
+				generator.shl(r9, cl);
+				generator.shr(r9, cl);
+				generator.mov(rcx, rdx);
+				generator.shr(rcx, 8);
+				generator.shl(r9, cl);
+				generator.not_(r9);
+
+				generator.and_(rax, r9);
+				generator.or_(rax, r8);
+
+				generator.pinsrq(Xbyak::Xmm(dest_id), rax, 0);
+
+				generator.pop(r9);
+				generator.pop(r8);
+				generator.pop(rdx);
+				generator.pop(rcx);
+				generator.pop(rax);
+				generator.db(0x9d); // popfq
+				return true;
+			} else if (decoded.instruction.operand_count_visible >= 4 &&
+			           decoded.operands[2].type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
+			           decoded.operands[3].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+				const uint8_t length = static_cast<uint8_t>(decoded.operands[2].imm.value.u & 0x3fu);
+				const uint8_t index  = static_cast<uint8_t>(decoded.operands[3].imm.value.u & 0x3fu);
+				const uint8_t shift  = static_cast<uint8_t>((64u - length) & 0x3fu);
+
+				generator.db(0x9c); // pushfq
+				generator.push(rax);
+				generator.push(rdx);
+				generator.push(r8);
+
+				generator.movq(rax, Xbyak::Xmm(dest_id));
+				generator.movq(rdx, Xbyak::Xmm(src_id));
+
+				if (shift != 0) {
+					generator.shl(rdx, shift);
+					generator.shr(rdx, shift);
+				}
+				if (index != 0) {
+					generator.shl(rdx, index);
+				}
+
+				uint64_t mask = (length == 0 || length == 64) ? UINT64_MAX : ((1ULL << length) - 1ULL);
+				mask <<= index;
+				generator.mov(r8, ~mask);
+				generator.and_(rax, r8);
+				generator.or_(rax, rdx);
+
+				generator.pinsrq(Xbyak::Xmm(dest_id), rax, 0);
+
+				generator.pop(r8);
+				generator.pop(rdx);
+				generator.pop(rax);
+				generator.db(0x9d); // popfq
+				return true;
+			}
+			return false;
+		}
+
+		case ZYDIS_MNEMONIC_MONITORX:
+		case ZYDIS_MNEMONIC_MWAITX: {
+			generator.pause();
+			return true;
+		}
+
+		default: return false;
+	}
+}
+#endif
 
 uint64_t ApplyReciprocalSquareRootPatches(const PatchModule& module,
                                         std::span<const ReciprocalSquareRootSite> sites,
@@ -878,6 +1070,11 @@ void RelocateRedZoneInstructions(PatchModule* module, const DecodedFunction& fun
 				}
 				if (protected_indirect_call) {
 					if (!GenerateProtectedIndirectCall(*decoded, module->trampoline_gen)) {
+						module->trampoline_gen.setSize(trampoline_offset);
+						return std::nullopt;
+					}
+				} else if (IsHostEmulatedAmdInstruction(decoded->instruction) && !HostHasSse4a()) {
+					if (!EmitEmulatedAmdInstruction(*decoded, module->trampoline_gen)) {
 						module->trampoline_gen.setSize(trampoline_offset);
 						return std::nullopt;
 					}
