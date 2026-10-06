@@ -52,15 +52,6 @@
 
 namespace Libs::Graphics {
 
-namespace {
-
-// The library cache key a prefetched compute pipeline compiles under.
-std::string ComputePrefetchKey(uint64_t program_id) {
-	std::string key(1, 'C');
-	key.append(reinterpret_cast<const char*>(&program_id), sizeof(program_id));
-	return key;
-}
-
 void DestroyPipelineObjects(const GraphicContext& graphics, const PipelineCache::Pipeline& pipeline) {
 	if (pipeline.pipeline != nullptr) {
 		graphics.device.destroyPipeline(pipeline.pipeline, nullptr);
@@ -70,6 +61,15 @@ void DestroyPipelineObjects(const GraphicContext& graphics, const PipelineCache:
 	if (pipeline.pixel_set_layout != nullptr) {
 		graphics.device.destroyDescriptorSetLayout(pipeline.pixel_set_layout, nullptr);
 	}
+}
+
+namespace {
+
+// The library cache key a prefetched compute pipeline compiles under.
+std::string ComputePrefetchKey(uint64_t program_id) {
+	std::string key(1, 'C');
+	key.append(reinterpret_cast<const char*>(&program_id), sizeof(program_id));
+	return key;
 }
 
 vk::PolygonMode ResolvePolygonMode(const HW::ModeControl& mode, bool cull_front, bool cull_back) {
