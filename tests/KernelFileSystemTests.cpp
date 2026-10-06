@@ -129,6 +129,34 @@ void TestSaveOpenVisibility() {
   Check(FileSystem::KernelClose(truncated) == OK, "close truncated save file");
 }
 
+void TestDescriptorSafety() {
+  constexpr char Path[] = "/savedata0/descriptor-safety.dat";
+  const int fd = FileSystem::KernelOpen(Path, 0xa01, 0777);
+  Check(fd >= 3, "open descriptor for safety test");
+  Check(FileSystem::KernelClose(fd) == OK, "first close succeeds");
+  Check(FileSystem::KernelClose(fd) == Libs::LibKernel::KERNEL_ERROR_EBADF,
+        "double close returns EBADF");
+  Check(FileSystem::KernelClose(-1) == Libs::LibKernel::KERNEL_ERROR_EBADF,
+        "negative fd close returns EBADF");
+  Check(FileSystem::KernelClose(9999) == Libs::LibKernel::KERNEL_ERROR_EBADF,
+        "out of bounds fd close returns EBADF");
+
+  char buf[8];
+  Check(FileSystem::KernelRead(fd, buf, sizeof(buf)) ==
+            Libs::LibKernel::KERNEL_ERROR_EBADF,
+        "read closed fd returns EBADF");
+  Check(FileSystem::KernelWrite(fd, buf, sizeof(buf)) ==
+            Libs::LibKernel::KERNEL_ERROR_EBADF,
+        "write closed fd returns EBADF");
+  Check(FileSystem::KernelLseek(fd, 0, 0) ==
+            Libs::LibKernel::KERNEL_ERROR_EBADF,
+        "lseek closed fd returns EBADF");
+  FileSystem::FileStat stat {};
+  Check(FileSystem::KernelFstat(fd, &stat) ==
+            Libs::LibKernel::KERNEL_ERROR_EBADF,
+        "fstat closed fd returns EBADF");
+}
+
 void CheckMountRoot(const std::filesystem::path &root) {
   Common::File cache;
   Check(cache.Create(root / "rpf.cache"), "create directory listing fixture");
@@ -1018,6 +1046,7 @@ int main(int, char**) {
   CheckAprPaths(temporary.Path());
   FileSystem::Mount(temporary.Path(), "/savedata0");
   TestSaveOpenVisibility();
+  TestDescriptorSafety();
   CheckSaveRename(temporary.Path(), "first-save");
   CheckSaveRename(temporary.Path(), "replacement-save");
   FileSystem::Shutdown();

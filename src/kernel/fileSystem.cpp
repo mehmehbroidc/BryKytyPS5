@@ -84,6 +84,7 @@ public:
 	KYTY_CLASS_NO_COPY(FileDescriptors);
 
 	int   CreateDescriptor();
+	int   CloseDescriptor(int d);
 	void  DeleteDescriptor(int d);
 	File* GetFile(int d);
 	File* GetFile(const std::filesystem::path& real_name);
@@ -196,25 +197,68 @@ int FileDescriptors::CreateDescriptor() {
 	return static_cast<int>(m_files.size()) + DESCRIPTOR_MIN - 1;
 }
 
+int FileDescriptors::CloseDescriptor(int d) {
+	if (d < DESCRIPTOR_MIN) {
+		return KERNEL_ERROR_EBADF;
+	}
+
+	File* file = nullptr;
+	{
+		Common::LockGuard lock(m_mutex);
+		auto index = static_cast<size_t>(d - DESCRIPTOR_MIN);
+		if (index >= m_files.size() || m_files[index] == nullptr) {
+			return KERNEL_ERROR_EBADF;
+		}
+		file           = m_files[index];
+		m_files[index] = nullptr;
+	}
+
+	if (file != nullptr) {
+		if (file->opened) {
+			if (!file->directory && file->special == SpecialFile::None) {
+				file->f.Close();
+			}
+			file->opened = false;
+		}
+		LOGF("\tClose: %s\n", Common::PathToString(file->real_name).c_str());
+		delete file;
+	}
+
+	return OK;
+}
+
 void FileDescriptors::DeleteDescriptor(int d) {
-	Common::LockGuard lock(m_mutex);
+	if (d < DESCRIPTOR_MIN) {
+		return;
+	}
 
-	auto index = static_cast<size_t>(d - DESCRIPTOR_MIN);
+	File* file = nullptr;
+	{
+		Common::LockGuard lock(m_mutex);
+		auto index = static_cast<size_t>(d - DESCRIPTOR_MIN);
+		if (index >= m_files.size() || m_files[index] == nullptr) {
+			return;
+		}
+		file           = m_files[index];
+		m_files[index] = nullptr;
+	}
 
-	EXIT_IF(index >= m_files.size());
-	EXIT_IF(m_files[index] == nullptr);
-	EXIT_IF(m_files[index]->opened);
-
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
-	// Close host files opened before a failed descriptor setup.
-	m_files[index]->f.Close();
-#endif
-
-	delete m_files[index];
-	m_files[index] = nullptr;
+	if (file != nullptr) {
+		if (file->opened) {
+			if (!file->directory && file->special == SpecialFile::None) {
+				file->f.Close();
+			}
+			file->opened = false;
+		}
+		delete file;
+	}
 }
 
 File* FileDescriptors::GetFile(int d) {
+	if (d < DESCRIPTOR_MIN) {
+		return nullptr;
+	}
+
 	Common::LockGuard lock(m_mutex);
 
 	auto index = static_cast<size_t>(d - DESCRIPTOR_MIN);
@@ -438,16 +482,22 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 		case 0: rw_mode = Common::File::Mode::Read; break;
 		case 1: rw_mode = Common::File::Mode::Write; break;
 		case 2: rw_mode = Common::File::Mode::ReadWrite; break;
-		default: EXIT("invalid flag_u: %u\n", flags_u);
+		default: return KERNEL_ERROR_EINVAL;
 	}
 
-	EXIT_NOT_IMPLEMENTED(directory && rw_mode != Common::File::Mode::Read);
-	EXIT_NOT_IMPLEMENTED(directory && (trunc || creat));
+	if (directory && rw_mode != Common::File::Mode::Read) {
+		return KERNEL_ERROR_EISDIR;
+	}
+	if (directory && (trunc || creat)) {
+		return KERNEL_ERROR_EISDIR;
+	}
 
 	int   descriptor = g_files->CreateDescriptor();
 	auto* file       = g_files->GetFile(descriptor);
 
-	EXIT_IF(file == nullptr || file->opened || file->directory);
+	if (file == nullptr || file->opened || file->directory) {
+		return KERNEL_ERROR_EMFILE;
+	}
 
 	file->name        = path;
 	file->readable    = rw_mode != Common::File::Mode::Write;
@@ -498,8 +548,10 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 			return KERNEL_ERROR_ENOTDIR;
 		}
 
-		EXIT_NOT_IMPLEMENTED(!directory && rw_mode != Common::File::Mode::Read);
-		EXIT_NOT_IMPLEMENTED(!directory && (trunc || creat));
+		if (rw_mode != Common::File::Mode::Read || trunc || creat) {
+			g_files->DeleteDescriptor(descriptor);
+			return KERNEL_ERROR_EISDIR;
+		}
 
 		const auto entries = Common::File::GetDirEntries(file->real_name);
 		file->dirents      = PackDirents(entries);
@@ -564,25 +616,7 @@ int KYTY_SYSV_ABI KernelClose(int d) {
 		return (result == OK ? OK : PosixToKernel(::Libs::Network::NetToPosix(result)));
 	}
 
-	auto* file = g_files->GetFile(d);
-
-	if (file == nullptr) {
-		return KERNEL_ERROR_EBADF;
-	}
-
-	EXIT_IF(!file->opened);
-
-	if (!file->directory && file->special == SpecialFile::None) {
-		file->f.Close();
-	}
-
-	file->opened = false;
-
-	LOGF("\tClose: %s\n", Common::PathToString(file->real_name).c_str());
-
-	g_files->DeleteDescriptor(d);
-
-	return OK;
+	return g_files->CloseDescriptor(d);
 }
 
 int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes) {
@@ -603,11 +637,9 @@ int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes) {
 
 	auto* file = g_files->GetFile(d);
 
-	if (file == nullptr) {
+	if (file == nullptr || !file->opened) {
 		return KERNEL_ERROR_EBADF;
 	}
-
-	EXIT_IF(!file->opened);
 
 	if (nbytes > INT_MAX) {
 		return KERNEL_ERROR_EINVAL;
@@ -686,12 +718,16 @@ int64_t KYTY_SYSV_ABI KernelWrite(int d, const void* buf, size_t nbytes) {
 		return KERNEL_ERROR_EBADF;
 	}
 
-	EXIT_NOT_IMPLEMENTED(file->directory);
-	EXIT_NOT_IMPLEMENTED(file->special != SpecialFile::None);
+	if (file->directory) {
+		return KERNEL_ERROR_EISDIR;
+	}
+	if (file->special != SpecialFile::None) {
+		return KERNEL_ERROR_EINVAL;
+	}
 
-	EXIT_IF(!file->opened);
-
-	EXIT_NOT_IMPLEMENTED(nbytes > UINT_MAX);
+	if (nbytes > UINT_MAX) {
+		return KERNEL_ERROR_EINVAL;
+	}
 
 	file->mutex.Lock();
 
@@ -734,15 +770,17 @@ int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offse
 
 	auto* file = g_files->GetFile(d);
 
-	if (file == nullptr) {
+	if (file == nullptr || !file->opened) {
 		return KERNEL_ERROR_EBADF;
 	}
 
-	EXIT_NOT_IMPLEMENTED(file->directory);
+	if (file->directory) {
+		return KERNEL_ERROR_EISDIR;
+	}
 
-	EXIT_IF(!file->opened);
-
-	EXIT_NOT_IMPLEMENTED(nbytes > UINT_MAX);
+	if (nbytes > UINT_MAX) {
+		return KERNEL_ERROR_EINVAL;
+	}
 
 	if (file->special == SpecialFile::Random) {
 		FillRandomBuffer(buf, nbytes);
@@ -901,12 +939,16 @@ int64_t KYTY_SYSV_ABI KernelPwrite(int d, const void* buf, size_t nbytes, int64_
 		return KERNEL_ERROR_EBADF;
 	}
 
-	EXIT_NOT_IMPLEMENTED(file->directory);
-	EXIT_NOT_IMPLEMENTED(file->special != SpecialFile::None);
+	if (file->directory) {
+		return KERNEL_ERROR_EISDIR;
+	}
+	if (file->special != SpecialFile::None) {
+		return KERNEL_ERROR_EINVAL;
+	}
 
-	EXIT_IF(!file->opened);
-
-	EXIT_NOT_IMPLEMENTED(nbytes > UINT_MAX);
+	if (nbytes > UINT_MAX) {
+		return KERNEL_ERROR_EINVAL;
+	}
 
 	file->mutex.Lock();
 
@@ -1008,11 +1050,9 @@ int64_t KYTY_SYSV_ABI KernelLseek(int d, int64_t offset, int whence) {
 
 	auto* file = g_files->GetFile(d);
 
-	if (file == nullptr) {
+	if (file == nullptr || !file->opened) {
 		return KERNEL_ERROR_EBADF;
 	}
-
-	EXIT_IF(!file->opened);
 
 	if (file->special != SpecialFile::None) {
 		return KERNEL_ERROR_ESPIPE;
@@ -1054,7 +1094,9 @@ int64_t KYTY_SYSV_ABI KernelLseek(int d, int64_t offset, int whence) {
 		file->dents_offset = position;
 	} else {
 		file->f.Seek(position);
-		EXIT_IF(file->f.Tell() != position);
+		if (file->f.Tell() != position) {
+			return KERNEL_ERROR_EINVAL;
+		}
 	}
 
 	LOGF("\tLseek (pos = %" PRIu64 ") to: %s\n", position,
@@ -1123,11 +1165,9 @@ int KYTY_SYSV_ABI KernelFstat(int d, FileStat* sb) {
 
 	auto* file = g_files->GetFile(d);
 
-	if (file == nullptr) {
+	if (file == nullptr || !file->opened) {
 		return KERNEL_ERROR_EBADF;
 	}
-
-	EXIT_IF(!file->opened);
 
 	LOGF("\tKernelFstat: %s\n", Common::PathToString(file->real_name).c_str());
 
@@ -1307,7 +1347,7 @@ int KYTY_SYSV_ABI KernelGetdirentries(int fd, char* buf, int nbytes, int64_t* ba
 
 	auto* file = g_files->GetFile(fd);
 
-	if (file == nullptr) {
+	if (file == nullptr || !file->opened) {
 		return KERNEL_ERROR_EBADF;
 	}
 
@@ -1315,7 +1355,6 @@ int KYTY_SYSV_ABI KernelGetdirentries(int fd, char* buf, int nbytes, int64_t* ba
 		return KERNEL_ERROR_EINVAL;
 	}
 
-	EXIT_IF(!file->opened);
 	Common::LockGuard lock(file->mutex);
 	if (file->dents_offset > file->dirents.size() || file->dents_offset % DIR_BLOCK_SIZE != 0) {
 		return KERNEL_ERROR_EINVAL;
