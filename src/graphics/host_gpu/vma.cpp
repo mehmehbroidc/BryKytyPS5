@@ -229,14 +229,28 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	EXIT_IF(allocator == nullptr || image.image != nullptr || image.allocation != nullptr);
 
 	VmaAllocationCreateInfo alloc_info {};
-	alloc_info.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+	alloc_info.preferredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
 
 	vk::Image::CType native_image = VK_NULL_HANDLE;
-	const auto        result       = static_cast<vk::Result>(
+	auto              result       = static_cast<vk::Result>(
 	    vmaCreateImage(allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
 	                   &alloc_info, &native_image, &image.allocation, nullptr));
+
+	// If dedicated VRAM is exhausted, fall back to host-visible shared system memory instead of crashing
+	if (result != vk::Result::eSuccess) {
+		alloc_info.requiredFlags  = 0;
+		alloc_info.preferredFlags = 0;
+		result = static_cast<vk::Result>(
+		    vmaCreateImage(allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
+		                   &alloc_info, &native_image, &image.allocation, nullptr));
+	}
+
 	image.image = native_image;
 	if (result != vk::Result::eSuccess) {
+		LOGF("vmaCreateImage failed: %s (extent=%ux%ux%u format=%d layers=%u levels=%u)\n",
+		     vk::to_string(result).c_str(), image_info.extent.width, image_info.extent.height,
+		     image_info.extent.depth, static_cast<int>(image_info.format), image_info.arrayLayers,
+		     image_info.mipLevels);
 		LogMemoryBudget();
 		return false;
 	}
