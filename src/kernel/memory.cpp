@@ -4276,6 +4276,10 @@ int KYTY_SYSV_ABI KernelMemoryPoolCommit(void* addr, size_t len, int type, int p
 
 	for (const auto& mapping: mappings) {
 		auto       failure_reason = GuestBackingStore::FailureReason::None;
+		if (!g_guest_address_space->ZeroBacking(mapping.phys_addr, mapping.size)) {
+			rollback();
+			return KERNEL_ERROR_ENOMEM;
+		}
 		const bool ok = g_guest_address_space->MapBacking(mapping.vaddr, mapping.size,
 		                                                  mapping.phys_addr, mode, &failure_reason);
 		if (!ok) {

@@ -31,6 +31,7 @@
 #include <fmt/format.h>
 #include <magic_enum.hpp>
 #include <memory>
+#include <mutex>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -695,6 +696,8 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 	}
 	// Report whatever guest context can be read safely before terminating: which guest thread
 	// faulted, the register file, the faulting code bytes and the top of its stack.
+	static std::mutex g_exception_mutex;
+	std::lock_guard   exception_lock(g_exception_mutex);
 	{
 		char thread_name[64] = "(host thread)";
 		if (auto self = Libs::LibKernel::PthreadSelfOrNull(); self != nullptr) {

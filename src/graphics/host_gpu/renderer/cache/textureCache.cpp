@@ -2852,7 +2852,7 @@ bool TextureCache::CollectGarbage(bool pressure_only) {
 		constexpr uint64_t release_margin = 256ull * 1024 * 1024;
 		const auto         release_threshold =
 		    m_critical_gc_memory - std::min(m_critical_gc_memory, release_margin);
-		size_t         deletions = aggressive ? 40 : pressured ? 20 : 10;
+		size_t         deletions = aggressive ? 80 : pressured ? 40 : 16;
 		std::vector<ImageId> candidates;
 		candidates.reserve(deletions);
 		// Deleting depth recursively deletes its stencil association, so finish LRU traversal
