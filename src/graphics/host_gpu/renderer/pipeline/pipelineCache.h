@@ -298,6 +298,7 @@ private:
 };
 
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);
+void DestroyPipelineObjects(const GraphicContext& graphics, const PipelineCache::Pipeline& pipeline);
 // Creates a graphics pipeline, from pipeline-library parts when `libraries` is given and the
 // pipeline qualifies. Returns -1 for a monolithic pipeline, otherwise a bit per library part it
 // compiled (vertex input, pre-rasterization, fragment shader, fragment output).

@@ -27,6 +27,7 @@
 #include <cstdlib>
 #include <future>
 #include <limits>
+#include <optional>
 #include <span>
 #include <string>
 #include <type_traits>
@@ -704,8 +705,8 @@ vk::Pipeline CreateLibraryPart(GraphicContext& graphics, vk::GraphicsPipelineLib
 	const auto   result =
 	    graphics.device.createGraphicsPipelines(driver_cache, 1, &info, nullptr, &pipeline);
 	if (result != vk::Result::eSuccess) {
-		EXIT_NOT_IMPLEMENTED(!prefetch);
-		LOGF("PipelineLibrary: prefetch compile failed (%s)\n", vk::to_string(result).c_str());
+		LOGF("PipelineLibrary: part compile failed (%s, part=0x%x, prefetch=%d)\n",
+		     vk::to_string(result).c_str(), static_cast<uint32_t>(part), prefetch);
 		return nullptr;
 	}
 	return pipeline;
@@ -848,10 +849,10 @@ vk::Pipeline CreateFragmentPart(GraphicContext& graphics, const GraphicsPipeline
 // range (see LibraryPushStages).
 //
 // A mesh pipeline has no vertex input part: its mesh shader is the pre-rasterization part.
-uint32_t CreateLibraryPipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
-                               const GraphicsPipelineState&           state,
-                               const PipelineCache::GraphicsPrograms& programs,
-                               PipelineLibraryCache& libraries, vk::PipelineCache driver_cache) {
+std::optional<uint32_t> CreateLibraryPipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+                                              const GraphicsPipelineState&           state,
+                                              const PipelineCache::GraphicsPrograms& programs,
+                                              PipelineLibraryCache& libraries, vk::PipelineCache driver_cache) {
 	using Part = vk::GraphicsPipelineLibraryFlagBitsEXT;
 	const vk::PipelineRenderingCreateInfo shader_rendering {};
 	vk::PipelineDynamicStateCreateInfo    shared_dynamic_state {};
@@ -886,17 +887,34 @@ uint32_t CreateLibraryPipeline(GraphicContext& graphics, PipelineCache::Pipeline
 		if (pre_raster == nullptr) {
 			fragment_compile = std::async(std::launch::async, compile);
 		} else {
-			fragment = libraries.Insert(keys.fragment, compile());
+			auto comp_fragment = compile();
+			if (comp_fragment == nullptr) {
+				return std::nullopt;
+			}
+			fragment = libraries.Insert(keys.fragment, comp_fragment);
 			built |= 1u << 2u;
 		}
 	}
 	if (pre_raster == nullptr) {
-		pre_raster = libraries.Insert(
-		    keys.pre_raster, CreatePreRasterPart(graphics, state, layout, driver_cache, false));
+		auto comp_pre_raster = CreatePreRasterPart(graphics, state, layout, driver_cache, false);
+		if (comp_pre_raster == nullptr) {
+			if (fragment_compile.valid()) {
+				auto f = fragment_compile.get();
+				if (f != nullptr) {
+					libraries.Insert(keys.fragment, f);
+				}
+			}
+			return std::nullopt;
+		}
+		pre_raster = libraries.Insert(keys.pre_raster, comp_pre_raster);
 		built |= 1u << 1u;
 	}
 	if (fragment_compile.valid()) {
-		fragment = libraries.Insert(keys.fragment, fragment_compile.get());
+		auto comp_fragment = fragment_compile.get();
+		if (comp_fragment == nullptr) {
+			return std::nullopt;
+		}
+		fragment = libraries.Insert(keys.fragment, comp_fragment);
 		built |= 1u << 2u;
 	}
 	if (vertex_input == nullptr && !state.mesh) {
@@ -904,9 +922,12 @@ uint32_t CreateLibraryPipeline(GraphicContext& graphics, PipelineCache::Pipeline
 		info.pVertexInputState   = &state.vertex_input;
 		info.pInputAssemblyState = &state.input_assembly;
 		info.pDynamicState       = &shared_dynamic_state;
-		vertex_input = libraries.Insert(keys.vertex_input,
-		                                CreateLibraryPart(graphics, Part::eVertexInputInterface,
-		                                                  info, shader_rendering, driver_cache));
+		auto comp_vertex_input = CreateLibraryPart(graphics, Part::eVertexInputInterface,
+		                                          info, shader_rendering, driver_cache);
+		if (comp_vertex_input == nullptr) {
+			return std::nullopt;
+		}
+		vertex_input = libraries.Insert(keys.vertex_input, comp_vertex_input);
 		built |= 1u << 0u;
 	}
 	if (fragment_output == nullptr) {
@@ -914,10 +935,18 @@ uint32_t CreateLibraryPipeline(GraphicContext& graphics, PipelineCache::Pipeline
 		info.pMultisampleState = &state.multisampling;
 		info.pColorBlendState  = &state.color_blending;
 		info.pDynamicState     = &state.dynamic_state;
-		fragment_output = libraries.Insert(keys.output,
-		                                   CreateLibraryPart(graphics, Part::eFragmentOutputInterface,
-		                                                     info, state.rendering, driver_cache));
+		auto comp_fragment_output = CreateLibraryPart(graphics, Part::eFragmentOutputInterface,
+		                                             info, state.rendering, driver_cache);
+		if (comp_fragment_output == nullptr) {
+			return std::nullopt;
+		}
+		fragment_output = libraries.Insert(keys.output, comp_fragment_output);
 		built |= 1u << 3u;
+	}
+
+	if (pre_raster == nullptr || fragment == nullptr || fragment_output == nullptr ||
+	    (!state.mesh && vertex_input == nullptr)) {
+		return std::nullopt;
 	}
 
 	const std::array all_parts {pre_raster, fragment, fragment_output, vertex_input};
@@ -930,9 +959,12 @@ uint32_t CreateLibraryPipeline(GraphicContext& graphics, PipelineCache::Pipeline
 	link.layout            = layout;
 	link.basePipelineIndex = -1;
 	EXIT_IF(pipeline.pipeline != nullptr);
-	EXIT_NOT_IMPLEMENTED(graphics.device.createGraphicsPipelines(nullptr, 1, &link, nullptr,
-	                                                             &pipeline.pipeline) !=
-	                     vk::Result::eSuccess);
+	const auto link_result = graphics.device.createGraphicsPipelines(nullptr, 1, &link, nullptr,
+	                                                                 &pipeline.pipeline);
+	if (link_result != vk::Result::eSuccess || pipeline.pipeline == nullptr) {
+		LOGF("PipelineLibrary: fast link failed (%s)\n", vk::to_string(link_result).c_str());
+		return std::nullopt;
+	}
 	libraries.QueueOptimizedLink(&pipeline, parts, layout);
 	pipeline.optimize_pending = true;
 	return built;
@@ -1161,8 +1193,17 @@ int CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pi
 	}
 	int library_parts = -1;
 	if (libraries != nullptr && UsesLibraries(graphics, state)) {
-		library_parts = static_cast<int>(
-		    CreateLibraryPipeline(graphics, pipeline, state, programs, *libraries, driver_cache));
+		const auto built =
+		    CreateLibraryPipeline(graphics, pipeline, state, programs, *libraries, driver_cache);
+		if (built.has_value()) {
+			library_parts = static_cast<int>(*built);
+		} else {
+			LOGF("PipelineLibrary: part compile or link failed, falling back to monolithic pipeline\n");
+			DestroyPipelineObjects(graphics, pipeline);
+			pipeline = {};
+			CreateMonolithicPipeline(graphics, pipeline, state, driver_cache);
+			library_parts = -1;
+		}
 	} else {
 		CreateMonolithicPipeline(graphics, pipeline, state, driver_cache);
 	}

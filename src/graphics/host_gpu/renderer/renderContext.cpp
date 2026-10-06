@@ -94,9 +94,9 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	if (access == PageFaultAccess::Write) {
 		DrainStats::ReasonScope reason(gpu_thread ? DrainStats::Reason::GpuThreadWriteFault
 		                                          : DrainStats::Reason::GuestWriteFault);
-		// Batch unprotect the 64 KiB slice around the fault address within mapped bounds
+		// Batch unprotect the 256 KiB slice around the fault address within mapped bounds
 		// so subsequent writes by worker threads into the same buffer avoid triggering page faults.
-		constexpr uint64_t BatchSliceSize = 64 * 1024;
+		constexpr uint64_t BatchSliceSize = 256 * 1024;
 		uint64_t write_vaddr = fault_vaddr;
 		uint64_t write_size  = 0x1000;
 		{
