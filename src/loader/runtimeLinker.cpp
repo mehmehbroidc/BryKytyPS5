@@ -40,12 +40,13 @@
 #endif
 #include <intrin.h>
 #include <windows.h>
-#else
 #if defined(__APPLE__)
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
+#include <sys/ucontext.h>
 #elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 #include <sys/uio.h>
+#include <ucontext.h>
 #include <unistd.h>
 #endif
 #endif
@@ -673,6 +674,26 @@ static bool HostHasSse4a() {
 
 static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
 	const auto* info = &exception_info;
+
+	// Intercept PS5 developer debug assert break (int 0x41).
+	// In ring 3 host execution, executing 'int 0x41' (0xcd, 0x41) triggers a General Protection
+	// Fault, surfaced as an access violation on Windows or a signal on POSIX.
+	if (info->native_context != nullptr && IsReadableRange(info->exception_address, 2)) {
+		const auto* code = reinterpret_cast<const uint8_t*>(info->exception_address);
+		if (code[0] == 0xcd && code[1] == 0x41) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+			auto* ctx = static_cast<PCONTEXT>(info->native_context);
+			ctx->Rip += 2;
+#elif defined(__APPLE__)
+			auto* ctx = static_cast<ucontext_t*>(info->native_context);
+			ctx->uc_mcontext->__ss.__rip += 2;
+#else
+			auto* ctx = static_cast<ucontext_t*>(info->native_context);
+			ctx->uc_mcontext.gregs[REG_RIP] += 2;
+#endif
+			return true;
+		}
+	}
 
 	if (info->type == Common::HostException::ExceptionType::IllegalInstruction &&
 	    Loader::X64InstructionEmulator::TryEmulate(info->native_context)) {
