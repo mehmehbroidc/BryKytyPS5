@@ -19,12 +19,14 @@
 #include <cinttypes>
 #include <cmath>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <fmt/format.h>
 #include <list>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -99,7 +101,7 @@ static void PrintAbortStringCandidate(const char* name, uint64_t addr) {
 	}
 
 	if (len >= 4) {
-		LOGF("\t %s string = \"%s\"\n", name, buf);
+		std::printf("\t %s string = \"%s\"\n", name, buf);
 	}
 }
 
@@ -127,7 +129,7 @@ static void PrintAbortWideStringCandidate(const char* name, uint64_t addr) {
 	}
 
 	if (len >= 4) {
-		LOGF("\t %s u16 = \"%s\"\n", name, buf);
+		std::printf("\t %s u16 = \"%s\"\n", name, buf);
 	}
 }
 
@@ -147,11 +149,11 @@ static void PrintAbortBytesCandidate(const char* name, uint64_t addr) {
 		return;
 	}
 
-	LOGF("\t %s bytes =", name);
+	std::printf("\t %s bytes =", name);
 	for (size_t i = 0; i < len; i++) {
-		LOGF(" %02" PRIx8, bytes[i]);
+		std::printf(" %02" PRIx8, bytes[i]);
 	}
-	LOGF("\n");
+	std::printf("\n");
 }
 
 static void PrintAbortPointerCandidate(const char* name, uint64_t addr) {
@@ -180,10 +182,36 @@ static void PrintAbortPointerArrayCandidate(const char* name, uint64_t addr) {
 			continue;
 		}
 
-		LOGF("\t %s[%d] = 0x%016" PRIx64 "\n", name, i, value);
+		std::printf("\t %s[%d] = 0x%016" PRIx64 "\n", name, i, value);
 		const auto child_name = fmt::format("{}[{}]", name, i);
 		PrintAbortPointerCandidate(child_name.c_str(), value);
 	}
+}
+
+static std::string GetAbortStringCandidate(uint64_t addr) {
+	if (!Graphics::HostMemoryIsReadable(addr)) {
+		return {};
+	}
+
+	const auto* ptr = reinterpret_cast<const char*>(static_cast<uintptr_t>(addr));
+	char        buf[257] {};
+	size_t      len = 0;
+
+	for (; len < sizeof(buf) - 1 && Graphics::HostMemoryIsReadable(addr + len); len++) {
+		const auto c = static_cast<unsigned char>(ptr[len]);
+		if (c == 0) {
+			break;
+		}
+		if (!std::isprint(c) && c != '\n' && c != '\r' && c != '\t') {
+			return {};
+		}
+		buf[len] = static_cast<char>(c);
+	}
+
+	if (len >= 4) {
+		return std::string(buf, len);
+	}
+	return {};
 }
 
 [[noreturn]] static KYTY_SYSV_ABI void abort(uint64_t arg0, uint64_t arg1, uint64_t arg2,
@@ -200,17 +228,45 @@ static void PrintAbortPointerArrayCandidate(const char* name, uint64_t addr) {
 
 	const auto ret = reinterpret_cast<uint64_t>(__builtin_return_address(0));
 
-	LOGF("Guest abort diagnostics:\n"
-	     "\t return = 0x%016" PRIx64 "\n"
-	     "\t rbp    = 0x%016" PRIx64 "\n"
-	     "\t rsp    = 0x%016" PRIx64 "\n"
-	     "\t arg0   = 0x%016" PRIx64 "\n"
-	     "\t arg1   = 0x%016" PRIx64 "\n"
-	     "\t arg2   = 0x%016" PRIx64 "\n"
-	     "\t arg3   = 0x%016" PRIx64 "\n"
-	     "\t arg4   = 0x%016" PRIx64 "\n"
-	     "\t arg5   = 0x%016" PRIx64 "\n",
-	     ret, rbp, rsp, arg0, arg1, arg2, arg3, arg4, arg5);
+	static std::mutex g_abort_mutex;
+	std::lock_guard   abort_lock(g_abort_mutex);
+
+	char thread_name[64] = "(host thread)";
+	if (auto self = Libs::LibKernel::PthreadSelfOrNull(); self != nullptr) {
+		if (Libs::LibKernel::PthreadGetname(self, thread_name) != 0) {
+			std::snprintf(thread_name, sizeof(thread_name), "(unnamed guest thread)");
+		}
+	}
+
+	auto*       linker      = Common::Singleton<Loader::RuntimeLinker>::Instance();
+	auto*       program     = (linker != nullptr) ? linker->FindProgramByAddrNoLock(ret) : nullptr;
+	std::string module_name = (program != nullptr)
+	                              ? Common::FilenameWithoutDirectory(Common::PathToGenericString(program->file_name))
+	                              : "unknown";
+	uint64_t    ret_offset  = (program != nullptr) ? (ret - program->base_vaddr) : ret;
+
+	std::printf("--- Guest abort() context ---\n");
+	std::printf("thread: %s\n", thread_name);
+	std::printf("caller: %s+0x%016" PRIx64 " (vaddr=0x%016" PRIx64 ")\n", module_name.c_str(), ret_offset, ret);
+	std::printf("registers / args:\n"
+	            "\t arg0 (rdi) = 0x%016" PRIx64 "\n"
+	            "\t arg1 (rsi) = 0x%016" PRIx64 "\n"
+	            "\t arg2 (rdx) = 0x%016" PRIx64 "\n"
+	            "\t arg3 (rcx) = 0x%016" PRIx64 "\n"
+	            "\t arg4 (r8)  = 0x%016" PRIx64 "\n"
+	            "\t arg5 (r9)  = 0x%016" PRIx64 "\n"
+	            "\t rbp        = 0x%016" PRIx64 "\n"
+	            "\t rsp        = 0x%016" PRIx64 "\n",
+	            arg0, arg1, arg2, arg3, arg4, arg5, rbp, rsp);
+
+	if (ret >= 48 && Graphics::HostMemoryRangeIsReadable(ret - 48, 96)) {
+		const auto* code = reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(ret - 48));
+		std::printf("code (ret-48 .. ret+48, call return at byte 48):");
+		for (int i = 0; i < 96; i++) {
+			std::printf("%s%02x", (i % 16 == 0) ? "\n " : " ", code[i]);
+		}
+		std::printf("\n");
+	}
 
 	PrintAbortPointerCandidate("arg0", arg0);
 	PrintAbortPointerCandidate("arg1", arg1);
@@ -225,33 +281,71 @@ static void PrintAbortPointerArrayCandidate(const char* name, uint64_t addr) {
 	PrintAbortPointerArrayCandidate("arg4", arg4);
 	PrintAbortPointerArrayCandidate("arg5", arg5);
 
-	if (rbp != 0) {
-		Common::Singleton<Loader::RuntimeLinker>::Instance()->StackTrace(rbp, rsp);
+	if (rbp != 0 && linker != nullptr) {
+		linker->StackTrace(rbp, rsp);
 	}
 
 	if (rsp != 0) {
-		LOGF("Guest abort stack words:\n");
-		auto* linker = Common::Singleton<Loader::RuntimeLinker>::Instance();
-		for (int i = 0; i < 16; i++) {
+		std::printf("Guest abort stack words:\n");
+		for (int i = 0; i < 32; i++) {
 			const auto addr = rsp + static_cast<uint64_t>(i) * sizeof(uint64_t);
 			if (!Graphics::HostMemoryIsReadable(addr)) {
 				break;
 			}
-			const auto value   = *reinterpret_cast<const uint64_t*>(static_cast<uintptr_t>(addr));
-			auto*      program = linker->FindProgramByAddr(value);
-			if (program != nullptr) {
-				auto module_name = Common::PathToString(program->file_name.filename());
-				LOGF("\t [%02d] 0x%016" PRIx64 " %s+0x%016" PRIx64 "\n", i, value,
-				     module_name.c_str(), value - program->base_vaddr);
+			const auto value         = *reinterpret_cast<const uint64_t*>(static_cast<uintptr_t>(addr));
+			auto*      program_entry = (linker != nullptr) ? linker->FindProgramByAddrNoLock(value) : nullptr;
+			if (program_entry != nullptr) {
+				auto mod = Common::FilenameWithoutDirectory(Common::PathToGenericString(program_entry->file_name));
+				std::printf("\t [%02d] 0x%016" PRIx64 " %s+0x%016" PRIx64 "\n", i, value,
+				            mod.c_str(), value - program_entry->base_vaddr);
 			} else {
-				LOGF("\t [%02d] 0x%016" PRIx64 "\n", i, value);
+				std::printf("\t [%02d] 0x%016" PRIx64 "\n", i, value);
 			}
 			PrintAbortPointerCandidate(fmt::format("stack[{:02d}]", i).c_str(), value);
 			PrintAbortPointerArrayCandidate(fmt::format("stack[{:02d}]", i).c_str(), value);
 		}
 	}
 
-	EXIT("Guest abort()\n");
+	auto last_output = Libs::GetLastGuestOutput();
+	if (!last_output.empty()) {
+		std::printf("Recent guest console output:\n%s\n", last_output.c_str());
+	}
+
+	std::string first_msg;
+	for (const auto val : {arg0, arg1, arg2, arg3, arg4, arg5}) {
+		if (first_msg.empty()) {
+			first_msg = GetAbortStringCandidate(val);
+		}
+		if (first_msg.empty() && LooksLikeAbortPointer(val)) {
+			for (int j = 0; j < 4; j++) {
+				const auto slot = val + static_cast<uint64_t>(j) * sizeof(uint64_t);
+				if (!Graphics::HostMemoryIsReadable(slot)) break;
+				const auto child = *reinterpret_cast<const uint64_t*>(static_cast<uintptr_t>(slot));
+				first_msg = GetAbortStringCandidate(child);
+				if (!first_msg.empty()) break;
+			}
+		}
+	}
+	if (first_msg.empty() && rsp != 0) {
+		for (int j = 0; j < 8; j++) {
+			const auto slot = rsp + static_cast<uint64_t>(j) * sizeof(uint64_t);
+			if (!Graphics::HostMemoryIsReadable(slot)) break;
+			const auto val = *reinterpret_cast<const uint64_t*>(static_cast<uintptr_t>(slot));
+			first_msg = GetAbortStringCandidate(val);
+			if (!first_msg.empty()) break;
+		}
+	}
+
+	std::fflush(stdout);
+	std::fflush(stderr);
+
+	if (!first_msg.empty()) {
+		EXIT("Guest abort() from %s+0x%016" PRIx64 " in thread %s: \"%s\"\n", module_name.c_str(),
+		     ret_offset, thread_name, first_msg.c_str());
+	} else {
+		EXIT("Guest abort() from %s+0x%016" PRIx64 " in thread %s\n", module_name.c_str(),
+		     ret_offset, thread_name);
+	}
 	std::abort();
 }
 
@@ -636,6 +730,10 @@ static KYTY_SYSV_ABI int snprintf(VA_ARGS) {
 int KYTY_SYSV_ABI fflush(FILE* stream) {
 	PRINT_NAME();
 
+	if (stream == nullptr || stream == stdout || stream == stderr) {
+		return ::fflush(stream);
+	}
+
 	EXIT_NOT_IMPLEMENTED(stream != stdout);
 
 	return ::fflush(stream);
@@ -758,9 +856,10 @@ int KYTY_SYSV_ABI LibcHeapErrorReportForGame(uint64_t msp, uint64_t ptr, uint64_
                                              uint64_t arg3, uint64_t arg4, uint64_t arg5) {
 	PRINT_NAME();
 
-	LOGF("\t temporary: heap error report ignored, msp=0x%016" PRIx64 ", ptr=0x%016" PRIx64
-	     ", error=0x%016" PRIx64 ", args=(0x%016" PRIx64 ",0x%016" PRIx64 ",0x%016" PRIx64 ")\n",
-	     msp, ptr, error, arg3, arg4, arg5);
+	std::printf("libc heap error report: msp=0x%016" PRIx64 ", ptr=0x%016" PRIx64
+	            ", error=0x%016" PRIx64 ", args=(0x%016" PRIx64 ",0x%016" PRIx64 ",0x%016" PRIx64 ")\n",
+	            msp, ptr, error, arg3, arg4, arg5);
+	std::fflush(stdout);
 
 	return 0;
 }

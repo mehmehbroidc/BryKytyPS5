@@ -719,15 +719,26 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 	// faulted, the register file, the faulting code bytes and the top of its stack.
 	static std::mutex g_exception_mutex;
 	std::lock_guard   exception_lock(g_exception_mutex);
-	{
-		char thread_name[64] = "(host thread)";
-		if (auto self = Libs::LibKernel::PthreadSelfOrNull(); self != nullptr) {
-			if (Libs::LibKernel::PthreadGetname(self, thread_name) != 0) {
-				std::snprintf(thread_name, sizeof(thread_name), "(unnamed guest thread)");
-			}
+
+	char thread_name[64] = "(host thread)";
+	if (auto self = Libs::LibKernel::PthreadSelfOrNull(); self != nullptr) {
+		if (Libs::LibKernel::PthreadGetname(self, thread_name) != 0) {
+			std::snprintf(thread_name, sizeof(thread_name), "(unnamed guest thread)");
 		}
+	}
+
+	auto*       linker      = Common::Singleton<Loader::RuntimeLinker>::Instance();
+	auto*       program     = (linker != nullptr) ? linker->FindProgramByAddrNoLock(info->exception_address) : nullptr;
+	std::string module_name = (program != nullptr)
+	                              ? Common::FilenameWithoutDirectory(Common::PathToGenericString(program->file_name))
+	                              : "unknown";
+	uint64_t    pc_offset   = (program != nullptr) ? (info->exception_address - program->base_vaddr) : info->exception_address;
+
+	{
 		std::printf("--- Guest fault context ---\n");
 		std::printf("thread: %s\n", thread_name);
+		std::printf("pc: %s+0x%016" PRIx64 " (0x%016" PRIx64 ")\n", module_name.c_str(), pc_offset,
+		            info->exception_address);
 		std::printf("rax=%016" PRIx64 " rbx=%016" PRIx64 " rcx=%016" PRIx64 " rdx=%016" PRIx64 "\n"
 		            "rsi=%016" PRIx64 " rdi=%016" PRIx64 " rbp=%016" PRIx64 " rsp=%016" PRIx64 "\n"
 		            "r8 =%016" PRIx64 " r9 =%016" PRIx64 " r10=%016" PRIx64 " r11=%016" PRIx64 "\n"
@@ -753,9 +764,10 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		}
 		std::fflush(stdout);
 	}
-	EXIT("Unhandled host exception: type=%u code=%u pc=0x%016" PRIx64
-	     " access=%u address=0x%016" PRIx64 "\n",
-	     static_cast<unsigned>(info->type), info->native_code, info->exception_address,
+	EXIT("Unhandled host exception: type=%u code=%u pc=%s+0x%016" PRIx64 " (0x%016" PRIx64 ")"
+	     " in thread %s access=%u address=0x%016" PRIx64 "\n",
+	     static_cast<unsigned>(info->type), info->native_code, module_name.c_str(), pc_offset,
+	     info->exception_address, thread_name,
 	     static_cast<unsigned>(info->access_violation_type), info->access_violation_vaddr);
 }
 
@@ -1523,14 +1535,17 @@ Program* RuntimeLinker::FindProgramByFileName(const std::filesystem::path& elf_n
 	return nullptr;
 }
 
-Program* RuntimeLinker::FindProgramByAddr(uint64_t vaddr) {
-	Common::LockGuard lock(m_mutex);
-
+Program* RuntimeLinker::FindProgramByAddrNoLock(uint64_t vaddr) {
 	for (auto* p: m_programs) {
+		if (p == nullptr || p->elf == nullptr) {
+			continue;
+		}
 		const auto* ehdr = p->elf->GetEhdr();
 		const auto* phdr = p->elf->GetPhdr();
 
-		EXIT_IF(phdr == nullptr || ehdr == nullptr);
+		if (phdr == nullptr || ehdr == nullptr) {
+			continue;
+		}
 
 		for (Elf64_Half i = 0; i < ehdr->e_phnum; i++) {
 			if (phdr[i].p_memsz != 0 &&
@@ -1548,22 +1563,29 @@ Program* RuntimeLinker::FindProgramByAddr(uint64_t vaddr) {
 	return nullptr;
 }
 
+Program* RuntimeLinker::FindProgramByAddr(uint64_t vaddr) {
+	Common::LockGuard lock(m_mutex);
+	return FindProgramByAddrNoLock(vaddr);
+}
+
 void RuntimeLinker::StackTrace(uint64_t frame_ptr, uint64_t stack_ptr) {
 	void* stack[20];
 	int   depth = WalkGuestStack(frame_ptr, stack_ptr, stack, static_cast<int>(std::size(stack)));
 
-	LOGF("Stack trace [thread = %d]:\n", Common::Thread::GetThreadIdUnique());
+	std::printf("Guest stack trace [thread = %d, depth = %d]:\n", Common::Thread::GetThreadIdUnique(),
+	            depth);
 
 	for (int i = 0; i < depth; i++) {
 		auto  vaddr = reinterpret_cast<uint64_t>(stack[i]);
 		auto* p     = FindProgramByAddr(vaddr);
-		LOGF("[%d] %016" PRIx64 ", off=%016" PRIx64 ", %s\n", i, vaddr,
-		     (p == nullptr ? 0 : vaddr - p->base_vaddr),
-		     (p == nullptr
-		          ? "???"
-		          : Common::FilenameWithoutDirectory(Common::PathToGenericString(p->file_name))
-		                .c_str()));
+		std::printf("\t [%02d] 0x%016" PRIx64 ", off=0x%016" PRIx64 ", %s\n", i, vaddr,
+		            (p == nullptr ? 0 : vaddr - p->base_vaddr),
+		            (p == nullptr
+		                 ? "???"
+		                 : Common::FilenameWithoutDirectory(Common::PathToGenericString(p->file_name))
+		                       .c_str()));
 	}
+	std::fflush(stdout);
 }
 
 static std::string GetProgramModuleName(const Program* program) {

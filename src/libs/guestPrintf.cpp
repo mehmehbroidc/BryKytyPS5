@@ -16,6 +16,8 @@
 
 #include <cfloat>
 #include <cmath>
+#include <mutex>
+#include <string>
 #include <vector>
 
 namespace Libs {
@@ -776,11 +778,28 @@ static int kyty_printf_internal(bool sn, char* sn_s, size_t sn_n, const char* fo
 		int s = snprintf(sn_s, sn_n, "%s", buffer.data());
 		EXIT_NOT_IMPLEMENTED(static_cast<size_t>(s) >= sn_n);
 	} else {
+		{
+			static std::mutex g_guest_out_mutex;
+			std::lock_guard   lock(g_guest_out_mutex);
+			extern std::string g_last_guest_output;
+			if (g_last_guest_output.size() > 8192) {
+				g_last_guest_output.clear();
+			}
+			g_last_guest_output += buffer.data();
+		}
 		LOGF_COLOR(Log::Color::BrightMagenta, "%s", buffer.data());
 	}
 
 	// return written chars without terminating \0
 	return static_cast<int>(idx);
+}
+
+std::string g_last_guest_output;
+
+std::string GetLastGuestOutput() {
+	static std::mutex g_guest_out_mutex;
+	std::lock_guard   lock(g_guest_out_mutex);
+	return g_last_guest_output;
 }
 
 static int kyty_vprintf(const char* format, VaList* va_list) {

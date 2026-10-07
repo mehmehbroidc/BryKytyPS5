@@ -4,6 +4,8 @@
 #include "common/abi.h"
 #include "common/common.h"
 
+#include <string>
+
 namespace Libs {
 
 struct VaContext;
@@ -19,6 +21,7 @@ guest_printf_std_func_t   GetGuestPrintfStdFunc();
 guest_printf_ctx_func_t   GetGuestPrintfCtxFunc();
 guest_snprintf_ctx_func_t GetGuestSnprintfCtxFunc();
 guest_vprintf_func_t      GetGuestVprintfFunc();
+std::string               GetLastGuestOutput();
 
 } // namespace Libs
 
