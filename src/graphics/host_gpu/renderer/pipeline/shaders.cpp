@@ -660,14 +660,31 @@ void CreateMonolithicPipeline(GraphicContext& graphics, PipelineCache::Pipeline&
 	pipeline_info.basePipelineIndex   = -1;
 
 	EXIT_IF(pipeline.pipeline != nullptr);
-	const auto result = graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info,
-	                                                            nullptr, &pipeline.pipeline);
+	auto result = graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info,
+	                                                      nullptr, &pipeline.pipeline);
+	if (result != vk::Result::eSuccess && driver_cache != nullptr) {
+		LOGF("Pipeline: vkCreateGraphicsPipelines failed (%s) with driver_cache, retrying without cache...\n",
+		     vk::to_string(result).c_str());
+		result = graphics.device.createGraphicsPipelines(nullptr, 1, &pipeline_info,
+		                                                 nullptr, &pipeline.pipeline);
+	}
+	if (result != vk::Result::eSuccess && pipeline_info.flags != vk::PipelineCreateFlags {}) {
+		LOGF("Pipeline: vkCreateGraphicsPipelines failed (%s), retrying without flags (0x%08x)...\n",
+		     vk::to_string(result).c_str(), static_cast<uint32_t>(pipeline_info.flags));
+		pipeline_info.flags = {};
+		result = graphics.device.createGraphicsPipelines(nullptr, 1, &pipeline_info,
+		                                                 nullptr, &pipeline.pipeline);
+	}
+	if (result != vk::Result::eSuccess) {
+		LOGF("Pipeline: vkCreateGraphicsPipelines failed (%s). Skipping draw.\n",
+		     vk::to_string(result).c_str());
+		pipeline.pipeline = nullptr;
+		return;
+	}
 	if (graphics_debug_dump_enabled()) {
 		LOGF("PipelineTrace: vkCreateGraphicsPipelines done result=%s pipeline=%p\n",
 		     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
 	}
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
-	EXIT_NOT_IMPLEMENTED(pipeline.pipeline == nullptr);
 }
 
 template <typename T>

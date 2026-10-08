@@ -2029,7 +2029,11 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(
 	}
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
 
-	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
+	if (cached->pipeline == nullptr) {
+		LOGF("Pipeline: graphics pipeline failed to create (VS=%" PRIu64 " PS=%" PRIu64 "), skipping draw\n",
+		     vs_id, ps_id);
+		return nullptr;
+	}
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
 
 	auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
