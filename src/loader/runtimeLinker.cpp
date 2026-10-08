@@ -714,6 +714,24 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
 			return true;
 		}
+
+		// If HandleGpuFault returned false, this access violation was NOT a valid GPU page fault.
+		// For guest code reading or writing unmapped, NULL, or invalid memory, recover gracefully
+		// rather than terminating the entire process.
+		auto* linker  = Common::Singleton<Loader::RuntimeLinker>::Instance();
+		auto* program = (linker != nullptr) ? linker->FindProgramByAddrNoLock(info->exception_address) : nullptr;
+		const bool is_guest_code = (program != nullptr) ||
+		                           (info->exception_address >= 0x0000000900000000ull &&
+		                            info->exception_address <  0x0000000980000000ull);
+
+		if (is_guest_code &&
+		    (info->access_violation_type == Common::HostException::AccessViolationType::Read ||
+		     info->access_violation_type == Common::HostException::AccessViolationType::Write) &&
+		    Loader::X64InstructionEmulator::TryRecoverAccessViolation(
+		        info->native_context, info->access_violation_vaddr,
+		        info->access_violation_type == Common::HostException::AccessViolationType::Write)) {
+			return true;
+		}
 	}
 	// Report whatever guest context can be read safely before terminating: which guest thread
 	// faulted, the register file, the faulting code bytes and the top of its stack.

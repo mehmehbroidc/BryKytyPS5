@@ -3,7 +3,10 @@
 #include "common/common.h"
 
 #include <Zydis/Zydis.h>
+#include <atomic>
 #include <bit>
+#include <cinttypes>
+#include <cstdio>
 #include <cstring>
 #if !defined(__APPLE__)
 #include <emmintrin.h>
@@ -407,6 +410,31 @@ struct Context {
 	void                   Advance(size_t length) { native->Rip += length; }
 	[[nodiscard]] void*    Xmm(uint8_t index) const { return &native->Xmm0 + index; }
 
+	uint64_t* GprPtr(uint8_t index) {
+		switch (index) {
+			case 0: return &native->Rax;
+			case 1: return &native->Rcx;
+			case 2: return &native->Rdx;
+			case 3: return &native->Rbx;
+			case 4: return &native->Rsp;
+			case 5: return &native->Rbp;
+			case 6: return &native->Rsi;
+			case 7: return &native->Rdi;
+			case 8: return &native->R8;
+			case 9: return &native->R9;
+			case 10: return &native->R10;
+			case 11: return &native->R11;
+			case 12: return &native->R12;
+			case 13: return &native->R13;
+			case 14: return &native->R14;
+			case 15: return &native->R15;
+			default: return nullptr;
+		}
+	}
+
+	[[nodiscard]] uint32_t GetEflags() const { return native->EFlags; }
+	void                   SetEflags(uint32_t flags) { native->EFlags = flags; }
+
 	void LoadGprs(uint64_t (&gpr)[16]) const {
 		const uint64_t registers[] = {native->Rax, native->Rcx, native->Rdx, native->Rbx,
 		                              native->Rsp, native->Rbp, native->Rsi, native->Rdi,
@@ -461,6 +489,35 @@ struct Context {
 			default: return nullptr;
 		}
 	}
+
+	uint64_t* GprPtr(uint8_t index) {
+		switch (index) {
+			case 0: return reinterpret_cast<uint64_t*>(&native->uc_mcontext->__ss.__rax);
+			case 1: return reinterpret_cast<uint64_t*>(&native->uc_mcontext->__ss.__rcx);
+			case 2: return reinterpret_cast<uint64_t*>(&native->uc_mcontext->__ss.__rdx);
+			case 3: return reinterpret_cast<uint64_t*>(&native->uc_mcontext->__ss.__rbx);
+			case 4: return reinterpret_cast<uint64_t*>(&native->uc_mcontext->__ss.__rsp);
+			case 5: return reinterpret_cast<uint64_t*>(&native->uc_mcontext->__ss.__rbp);
+			case 6: return reinterpret_cast<uint64_t*>(&native->uc_mcontext->__ss.__rsi);
+			case 7: return reinterpret_cast<uint64_t*>(&native->uc_mcontext->__ss.__rdi);
+			case 8: return reinterpret_cast<uint64_t*>(&native->uc_mcontext->__ss.__r8);
+			case 9: return reinterpret_cast<uint64_t*>(&native->uc_mcontext->__ss.__r9);
+			case 10: return reinterpret_cast<uint64_t*>(&native->uc_mcontext->__ss.__r10);
+			case 11: return reinterpret_cast<uint64_t*>(&native->uc_mcontext->__ss.__r11);
+			case 12: return reinterpret_cast<uint64_t*>(&native->uc_mcontext->__ss.__r12);
+			case 13: return reinterpret_cast<uint64_t*>(&native->uc_mcontext->__ss.__r13);
+			case 14: return reinterpret_cast<uint64_t*>(&native->uc_mcontext->__ss.__r14);
+			case 15: return reinterpret_cast<uint64_t*>(&native->uc_mcontext->__ss.__r15);
+			default: return nullptr;
+		}
+	}
+
+	[[nodiscard]] uint32_t GetEflags() const {
+		return static_cast<uint32_t>(native->uc_mcontext->__ss.__rflags);
+	}
+	void SetEflags(uint32_t flags) {
+		native->uc_mcontext->__ss.__rflags = static_cast<uint64_t>(flags);
+	}
 #else
 	ucontext_t* native;
 
@@ -475,6 +532,23 @@ struct Context {
 			return nullptr;
 		}
 		return native->uc_mcontext.fpregs->_xmm[index].element;
+	}
+
+	uint64_t* GprPtr(uint8_t index) {
+		constexpr int registers[] = {REG_RAX, REG_RCX, REG_RDX, REG_RBX, REG_RSP, REG_RBP,
+		                             REG_RSI, REG_RDI, REG_R8,  REG_R9,  REG_R10, REG_R11,
+		                             REG_R12, REG_R13, REG_R14, REG_R15};
+		if (index < 16) {
+			return reinterpret_cast<uint64_t*>(&native->uc_mcontext.gregs[registers[index]]);
+		}
+		return nullptr;
+	}
+
+	[[nodiscard]] uint32_t GetEflags() const {
+		return static_cast<uint32_t>(native->uc_mcontext.gregs[REG_EFL]);
+	}
+	void SetEflags(uint32_t flags) {
+		native->uc_mcontext.gregs[REG_EFL] = static_cast<greg_t>(flags);
 	}
 
 	void LoadGprs(uint64_t (&gpr)[16]) const {
@@ -777,6 +851,215 @@ bool TryEmulate(void* native_context) {
 #else
 	return TryEmulateSse4a(context);
 #endif
+}
+
+static void ClearRegister(Context& context, ZydisRegister reg,
+                          const ZydisDecodedInstruction& instruction,
+                          const ZydisDecodedOperand& operand) {
+	const auto reg_class = ZydisRegisterGetClass(reg);
+
+	if (reg_class == ZYDIS_REGCLASS_GPR) {
+		if (reg == ZYDIS_REGISTER_AH) {
+			if (auto* ptr = context.GprPtr(0)) {
+				*ptr &= ~0xFF00ull;
+			}
+			return;
+		}
+		if (reg == ZYDIS_REGISTER_CH) {
+			if (auto* ptr = context.GprPtr(1)) {
+				*ptr &= ~0xFF00ull;
+			}
+			return;
+		}
+		if (reg == ZYDIS_REGISTER_DH) {
+			if (auto* ptr = context.GprPtr(2)) {
+				*ptr &= ~0xFF00ull;
+			}
+			return;
+		}
+		if (reg == ZYDIS_REGISTER_BH) {
+			if (auto* ptr = context.GprPtr(3)) {
+				*ptr &= ~0xFF00ull;
+			}
+			return;
+		}
+
+		const int reg_id = ZydisRegisterGetId(reg);
+		if (reg_id < 0 || reg_id >= 16) {
+			return;
+		}
+		auto* ptr = context.GprPtr(static_cast<uint8_t>(reg_id));
+		if (ptr == nullptr) {
+			return;
+		}
+
+		if (operand.size >= 32) {
+			// In x86-64, writes to 32-bit or 64-bit GPRs zero the upper 32/64 bits.
+			*ptr = 0;
+		} else if (operand.size == 16) {
+			*ptr &= ~0xFFFFull;
+		} else if (operand.size == 8) {
+			*ptr &= ~0xFFull;
+		}
+		return;
+	}
+
+	if (reg_class == ZYDIS_REGCLASS_XMM) {
+		const int reg_id = ZydisRegisterGetId(reg);
+		if (reg_id >= 0 && reg_id < 16) {
+			if (auto* xmm = context.Xmm(static_cast<uint8_t>(reg_id))) {
+				std::memset(xmm, 0, 16);
+			}
+			if (instruction.encoding == ZYDIS_INSTRUCTION_ENCODING_VEX) {
+				context.ClearUpperYmm(static_cast<uint8_t>(reg_id));
+			}
+		}
+		return;
+	}
+
+	if (reg_class == ZYDIS_REGCLASS_YMM) {
+		const int reg_id = ZydisRegisterGetId(reg);
+		if (reg_id >= 0 && reg_id < 16) {
+			if (auto* xmm = context.Xmm(static_cast<uint8_t>(reg_id))) {
+				std::memset(xmm, 0, 16);
+			}
+			context.ClearUpperYmm(static_cast<uint8_t>(reg_id));
+		}
+		return;
+	}
+}
+
+bool TryRecoverAccessViolation(void* native_context, uint64_t fault_addr, bool is_write) {
+	if (native_context == nullptr) {
+		return false;
+	}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	Context context {static_cast<PCONTEXT>(native_context)};
+#elif defined(__APPLE__)
+	auto* saved_context = static_cast<ucontext_t*>(native_context);
+	if (saved_context->uc_mcontext == nullptr) {
+		return false;
+	}
+	Context context {saved_context};
+#else
+	Context context {static_cast<ucontext_t*>(native_context)};
+#endif
+
+	const uint64_t rip = context.Rip();
+	if (rip == 0) {
+		return false;
+	}
+
+	// Prevent infinite fault loop at the exact same instruction pointer
+	thread_local uint64_t t_last_rip           = 0;
+	thread_local uint32_t t_consecutive_faults = 0;
+	if (rip == t_last_rip) {
+		if (++t_consecutive_faults > 100) {
+			return false;
+		}
+	} else {
+		t_last_rip           = rip;
+		t_consecutive_faults = 1;
+	}
+
+	ZydisDecoder decoder {};
+	if (!ZYAN_SUCCESS(
+	        ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64))) {
+		return false;
+	}
+
+	ZydisDecodedInstruction instruction {};
+	ZydisDecodedOperand     operands[ZYDIS_MAX_OPERAND_COUNT] {};
+	if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(
+	        &decoder, reinterpret_cast<const void*>(rip), 15, &instruction, operands))) {
+		return false;
+	}
+
+	if (instruction.length == 0 || instruction.length > 15) {
+		return false;
+	}
+
+	// Stack push: decrement RSP
+	if (instruction.mnemonic == ZYDIS_MNEMONIC_PUSH) {
+		auto* rsp = context.GprPtr(4);
+		if (rsp != nullptr) {
+			*rsp -= 8;
+		}
+		context.Advance(instruction.length);
+		return true;
+	}
+
+	// Stack pop: clear destination register and increment RSP
+	if (instruction.mnemonic == ZYDIS_MNEMONIC_POP) {
+		if (instruction.operand_count > 0 && operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+			ClearRegister(context, operands[0].reg.value, instruction, operands[0]);
+		}
+		auto* rsp = context.GprPtr(4);
+		if (rsp != nullptr) {
+			*rsp += 8;
+		}
+		context.Advance(instruction.length);
+		return true;
+	}
+
+	// TEST: 0 & anything = 0 -> ZF=1, PF=1; clear CF, SF, OF
+	if (instruction.mnemonic == ZYDIS_MNEMONIC_TEST) {
+		uint32_t flags = context.GetEflags();
+		flags &= ~(0x0001u | 0x0004u | 0x0010u | 0x0040u | 0x0080u | 0x0800u);
+		flags |= (0x0040u | 0x0004u);
+		context.SetEflags(flags);
+		context.Advance(instruction.length);
+		return true;
+	}
+
+	// CMP: assume memory value is 0 -> ZF=1, PF=1
+	if (instruction.mnemonic == ZYDIS_MNEMONIC_CMP) {
+		uint32_t flags = context.GetEflags();
+		flags &= ~(0x0001u | 0x0004u | 0x0010u | 0x0040u | 0x0080u | 0x0800u);
+		flags |= (0x0040u | 0x0004u);
+		context.SetEflags(flags);
+		context.Advance(instruction.length);
+		return true;
+	}
+
+	// Check if this instruction accesses memory
+	bool accesses_memory = false;
+	for (uint8_t i = 0; i < instruction.operand_count; ++i) {
+		if (operands[i].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+			accesses_memory = true;
+			break;
+		}
+	}
+
+	if (!accesses_memory) {
+		return false;
+	}
+
+	// If the instruction writes to register(s) from memory, clear them to neutral zero.
+	// For memory writes, the write to invalid memory is dropped (no-op).
+	for (uint8_t i = 0; i < instruction.operand_count; ++i) {
+		const auto& op = operands[i];
+		if (op.type == ZYDIS_OPERAND_TYPE_REGISTER &&
+		    (op.actions & ZYDIS_OPERAND_ACTION_WRITE) != 0) {
+			if (op.reg.value != ZYDIS_REGISTER_RSP &&
+			    op.reg.value != ZYDIS_REGISTER_RFLAGS) {
+				ClearRegister(context, op.reg.value, instruction, op);
+			}
+		}
+	}
+
+	static std::atomic<uint64_t> s_recovered_count {0};
+	const uint64_t count = s_recovered_count.fetch_add(1, std::memory_order_relaxed);
+	if (count < 20 || (count % 500) == 0) {
+		std::printf("[MemoryRecovery] Intercepted and recovered guest access violation #%" PRIu64
+		            " at RIP=0x%016" PRIx64 " (len=%u, addr=0x%016" PRIx64 ", %s)\n",
+		            count + 1, rip, instruction.length, fault_addr, is_write ? "write" : "read");
+		std::fflush(stdout);
+	}
+
+	context.Advance(instruction.length);
+	return true;
 }
 
 } // namespace Loader::X64InstructionEmulator

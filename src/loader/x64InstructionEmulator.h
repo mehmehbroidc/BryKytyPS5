@@ -10,6 +10,7 @@ namespace Loader::X64InstructionEmulator {
                                          const ZydisDecodedOperand* operands);
 uint64_t           PatchReciprocalSquareRoots(uint64_t address, uint64_t size);
 [[nodiscard]] bool TryEmulate(void* native_context);
+[[nodiscard]] bool TryRecoverAccessViolation(void* native_context, uint64_t fault_addr, bool is_write);
 
 } // namespace Loader::X64InstructionEmulator
 
