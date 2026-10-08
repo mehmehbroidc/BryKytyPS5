@@ -856,10 +856,11 @@ bool TryEmulate(void* native_context) {
 static void ClearRegister(Context& context, ZydisRegister reg,
                           const ZydisDecodedInstruction& instruction,
                           const ZydisDecodedOperand& operand) {
-	const bool is_gpr = (reg_class == ZYDIS_REGCLASS_GPR8 ||
-	                     reg_class == ZYDIS_REGCLASS_GPR16 ||
-	                     reg_class == ZYDIS_REGCLASS_GPR32 ||
-	                     reg_class == ZYDIS_REGCLASS_GPR64);
+	const auto reg_class = ZydisRegisterGetClass(reg);
+	const bool is_gpr    = (reg_class == ZYDIS_REGCLASS_GPR8 ||
+	                        reg_class == ZYDIS_REGCLASS_GPR16 ||
+	                        reg_class == ZYDIS_REGCLASS_GPR32 ||
+	                        reg_class == ZYDIS_REGCLASS_GPR64);
 
 	if (is_gpr) {
 		if (reg == ZYDIS_REGISTER_AH) {
