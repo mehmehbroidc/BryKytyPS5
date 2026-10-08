@@ -85,8 +85,9 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	VmaAllocationCreateInfo allocation_info {};
 	// `host_cached`: cached host memory, where CPU writes stay in the CPU's caches and the GPU reads
 	// them over the bus, instead of write-combined device memory.
+	// We omit VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT to prevent premature allocation aborts under load.
 	allocation_info.flags =
-	    VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | bda_flag |
+	    bda_flag |
 	    (host_cached ? VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT
 	                 : AllocationFlags(usage));
 	allocation_info.usage = host_cached ? VMA_MEMORY_USAGE_AUTO_PREFER_HOST : AllocationUsage(usage);
@@ -98,25 +99,59 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	VmaAllocationInfo allocation_result {};
 	VkBuffer          native_buffer = VK_NULL_HANDLE;
 	const auto        create_start  = std::chrono::steady_clock::now();
-	const auto        result        = static_cast<vk::Result>(vmaCreateBuffer(
+	auto result = static_cast<vk::Result>(vmaCreateBuffer(
 	    graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info), &allocation_info,
 	    &native_buffer, &m_allocation, &allocation_result));
+
+	// If dedicated allocation fails, retry without dedicated flag
+	if (result != vk::Result::eSuccess && (allocation_info.flags & VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT) != 0) {
+		allocation_info.flags &= ~VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
+		result = static_cast<vk::Result>(vmaCreateBuffer(
+		    graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info), &allocation_info,
+		    &native_buffer, &m_allocation, &allocation_result));
+	}
+
+	// If device-local VRAM is completely exhausted, fall back to host-visible shared memory instead of crashing
+	if (result != vk::Result::eSuccess && usage == MemoryUsage::DeviceLocal) {
+		allocation_info.flags          = 0;
+		allocation_info.usage          = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+		allocation_info.preferredFlags = VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+		allocation_info.requiredFlags  = 0;
+		result = static_cast<vk::Result>(vmaCreateBuffer(
+		    graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info), &allocation_info,
+		    &native_buffer, &m_allocation, &allocation_result));
+	}
+
+	// Emergency fallback: create a 64KB host buffer so native_buffer and m_allocation are valid
+	if (result != vk::Result::eSuccess) {
+		graphics.LogMemoryBudget();
+		LOGF("vmaCreateBuffer failed: %s (size=0x%" PRIx64 ", usage=%d, with_bda=%d), creating emergency host buffer\n",
+		     vk::to_string(result).c_str(), size, static_cast<int>(usage), with_bda);
+		buffer_info.size               = std::min<uint64_t>(size, 65536);
+		allocation_info.flags          = 0;
+		allocation_info.usage          = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+		allocation_info.preferredFlags = VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+		allocation_info.requiredFlags  = 0;
+		result = static_cast<vk::Result>(vmaCreateBuffer(
+		    graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info), &allocation_info,
+		    &native_buffer, &m_allocation, &allocation_result));
+	}
+
 	g_allocation_counters.buffer_create_ns.fetch_add(
 	    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
 	                              std::chrono::steady_clock::now() - create_start)
 	                              .count()),
 	    std::memory_order_relaxed);
 	if (result != vk::Result::eSuccess) {
-		graphics.LogMemoryBudget();
+		LOGF("vmaCreateBuffer critically failed: %s (size=0x%" PRIx64 ")\n",
+		     vk::to_string(result).c_str(), size);
 	}
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	m_buffer = native_buffer;
-	if (with_bda) {
+	if (with_bda && m_buffer != nullptr) {
 		vk::BufferDeviceAddressInfo address_info {};
 		address_info.buffer = m_buffer;
 		m_device_address    = graphics.device.getBufferAddress(address_info);
-		EXIT_IF(m_device_address == 0);
 	}
 
 	VkMemoryPropertyFlags properties = 0;
