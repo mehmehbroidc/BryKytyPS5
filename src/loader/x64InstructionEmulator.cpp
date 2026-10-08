@@ -856,9 +856,12 @@ bool TryEmulate(void* native_context) {
 static void ClearRegister(Context& context, ZydisRegister reg,
                           const ZydisDecodedInstruction& instruction,
                           const ZydisDecodedOperand& operand) {
-	const auto reg_class = ZydisRegisterGetClass(reg);
+	const bool is_gpr = (reg_class == ZYDIS_REGCLASS_GPR8 ||
+	                     reg_class == ZYDIS_REGCLASS_GPR16 ||
+	                     reg_class == ZYDIS_REGCLASS_GPR32 ||
+	                     reg_class == ZYDIS_REGCLASS_GPR64);
 
-	if (reg_class == ZYDIS_REGCLASS_GPR) {
+	if (is_gpr) {
 		if (reg == ZYDIS_REGISTER_AH) {
 			if (auto* ptr = context.GprPtr(0)) {
 				*ptr &= ~0xFF00ull;
@@ -1042,8 +1045,12 @@ bool TryRecoverAccessViolation(void* native_context, uint64_t fault_addr, bool i
 		const auto& op = operands[i];
 		if (op.type == ZYDIS_OPERAND_TYPE_REGISTER &&
 		    (op.actions & ZYDIS_OPERAND_ACTION_WRITE) != 0) {
-			if (op.reg.value != ZYDIS_REGISTER_RSP &&
-			    op.reg.value != ZYDIS_REGISTER_RFLAGS) {
+			const auto enclosing =
+			    ZydisRegisterGetLargestEnclosing(ZYDIS_MACHINE_MODE_LONG_64, op.reg.value);
+			if (enclosing != ZYDIS_REGISTER_RSP &&
+			    op.reg.value != ZYDIS_REGISTER_RFLAGS &&
+			    op.reg.value != ZYDIS_REGISTER_EFLAGS &&
+			    op.reg.value != ZYDIS_REGISTER_FLAGS) {
 				ClearRegister(context, op.reg.value, instruction, op);
 			}
 		}
